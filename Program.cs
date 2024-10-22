@@ -6,6 +6,8 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Serilog;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
 using SocketConsole.Models;
 
 // Настройка логгера
@@ -37,6 +39,44 @@ await host.RunAsync();
 // Класс фоновой службы
 public class BackgroundWorkerService : BackgroundService
 {
+    private IConnection _connection;
+    private IModel _channel;
+
+    public BackgroundWorkerService()
+    {
+        // Настройка RabbitMQ
+        var factory = new ConnectionFactory
+        {
+            Uri = new Uri("AMQP://admin:admin@172.16.211.18/termidesk")
+        };
+
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
+
+        try
+        {
+            // Декларация очереди для получения сообщений
+            _channel.QueueDeclare(queue: "from_bpmn_queue",
+                                 durable: true,
+                                 exclusive: false,
+                                 autoDelete: false,
+                                 arguments: null);
+
+            // Декларация очереди для отправки сообщений
+            _channel.QueueDeclare(queue: "to_bpmn_queue",
+                                 durable: true,
+                                 exclusive: false,
+                                 autoDelete: false,
+                                 arguments: null);
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Error occured:{ex.Message}");
+            throw;
+        }
+       
+    }
+
     public Card112ChangedRequest DeserializeXmlToCard112(string xmlMessage)
     {
         XmlSerializer serializer = new XmlSerializer(typeof(SoapEnvelope));
@@ -47,6 +87,7 @@ public class BackgroundWorkerService : BackgroundService
             return envelope.Body.Card112ChangedRequest;
         }
     }
+
     string ExtractXmlFromMessage(string message)
     {
         // Ищем начало XML-данных после заголовков HTTP
@@ -59,7 +100,6 @@ public class BackgroundWorkerService : BackgroundService
         throw new InvalidOperationException("XML данных не найдено в сообщении");
     }
 
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         IPAddress ipAddress = IPAddress.Any; // Можно указать конкретный IP, если требуется
@@ -68,6 +108,9 @@ public class BackgroundWorkerService : BackgroundService
         TcpListener listener = new TcpListener(ipAddress, port);
         listener.Start();
         Log.Information("Server is running. Waiting for connections...");
+
+        // Начинаем прослушивание сообщений из RabbitMQ
+        StartListeningToRabbitMq();
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -121,6 +164,10 @@ public class BackgroundWorkerService : BackgroundService
                     // Десериализация сообщения
                     var cardRequest = DeserializeXmlToCard112(xmlMessage);
                     Log.Information($"Card ID: {cardRequest.EmergencyCardId}, Creator: {cardRequest.Creator}");
+
+                    // Отправка сообщения в RabbitMQ
+                    PublishMessage(cardRequest);
+
                 }
                 catch (Exception ex)
                 {
@@ -135,5 +182,39 @@ public class BackgroundWorkerService : BackgroundService
                 Log.Error($"Ошибка: {ex.Message}");
             }
         }
+    }
+
+    private void StartListeningToRabbitMq()
+    {
+        // Создание обработчика сообщений из RabbitMQ
+        var consumer = new EventingBasicConsumer(_channel);
+        consumer.Received += (model, ea) =>
+        {
+            var body = ea.Body.ToArray();
+            var message = Encoding.UTF8.GetString(body);
+            Log.Information($"Received from broker: {message}");
+        };
+
+        _channel.BasicConsume(queue: "from_bpmn_queue",
+                             autoAck: true,
+                             consumer: consumer);
+    }
+
+    private void PublishMessage(Card112ChangedRequest cardRequest)
+    {
+        var body = Encoding.UTF8.GetBytes(cardRequest.ToString()); // Преобразуйте объект в строку или JSON
+
+        _channel.BasicPublish(exchange: "",
+                             routingKey: "to_bpmn_queue",
+                             basicProperties: null,
+                             body: body);
+        Log.Information($"Message published to in RabbitMq to_bpmn_queue");
+    }
+
+    public override void Dispose()
+    {
+        _channel.Close();
+        _connection.Close();
+        base.Dispose();
     }
 }
