@@ -10,6 +10,9 @@ using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using SocketConsole.Models;
 
+
+
+Console.Title = "server";
 // Настройка логгера
 var builder = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
